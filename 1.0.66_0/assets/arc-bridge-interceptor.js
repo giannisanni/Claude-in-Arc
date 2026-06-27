@@ -8,7 +8,7 @@
  * them here via self._arcBridgeInterceptor.handleBridgeToolCall().
  */
 
-const _INTERCEPTOR_VERSION = '0.3.1';
+const _INTERCEPTOR_VERSION = '0.4.0';
 const _MAX_PAGE_TEXT = 50000;
 const _STORAGE_KEY = 'claude_arc_mcp_group';
 
@@ -70,6 +70,18 @@ async function _captureBase64(targetTabId) {
 }
 function _imageResult(base64) {
   return { content: [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: base64 } }] };
+}
+// Like _imageResult, but flags the Arc gotcha: captureVisibleTab returns a
+// stale frame for a tab that isn't the foreground tab, so a screenshot of a
+// backgrounded tab can silently look "unchanged". DOM ops still work; the note
+// tells the caller to trust read_page/javascript_tool over the pixels.
+async function _captureWithNote(tabId) {
+  const base64 = await _captureBase64(tabId);
+  const content = [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: base64 } }];
+  let hidden = false;
+  try { hidden = await _execInPage(tabId, () => document.visibilityState === 'hidden'); } catch (e) {}
+  if (hidden) content.push({ type: 'text', text: '[arc] This tab is not the foreground tab, so the screenshot may be a stale frame. Verify live state with read_page or javascript_tool.' });
+  return { content };
 }
 async function _execInPage(tabId, func, args = []) {
   const [res] = await chrome.scripting.executeScript({ target: { tabId }, func, args, world: 'MAIN' });
@@ -222,11 +234,144 @@ const TOOL_HANDLERS = {
     }
   },
 
+  // Natural-language-ish element finder. We can't run a model in the page, so
+  // we score visible elements by how well the query tokens match their text,
+  // role, type, name, aria-label and placeholder, with light boosts for intent
+  // words (button/link/search/input/field/checkbox). Returns up to 20 matches
+  // with data-arc-ref ids usable by computer/form_input.
+  async find(args) {
+    const { query, tabId } = args || {};
+    if (!query) return _err('query is required.');
+    let id;
+    try { id = await _resolveTabId(tabId); } catch (e) { return _err(e.message); }
+    try {
+      const items = await _execInPage(id, (q) => {
+        const tokens = q.toLowerCase().split(/\s+/).filter(Boolean);
+        const intent = {
+          button: ['button', '[role="button"]', 'input[type="submit"]', 'input[type="button"]'],
+          link: ['a[href]', '[role="link"]'],
+          search: ['input[type="search"]', 'input[name*="search" i]', 'input[placeholder*="search" i]', '[role="searchbox"]'],
+          input: ['input', 'textarea', 'select', '[contenteditable="true"]'],
+          field: ['input', 'textarea', 'select'],
+          checkbox: ['input[type="checkbox"]'],
+        };
+        const els = new Set(document.querySelectorAll('a,button,input,select,textarea,summary,label,[role],[onclick],[contenteditable="true"],h1,h2,h3'));
+        for (const k of Object.keys(intent)) {
+          if (tokens.includes(k)) for (const sel of intent[k]) document.querySelectorAll(sel).forEach(e => els.add(e));
+        }
+        const scored = []; let i = 0;
+        for (const el of els) {
+          const r = el.getBoundingClientRect();
+          if (r.width === 0 || r.height === 0) continue;
+          const tag = el.tagName.toLowerCase();
+          const type = (el.type || '').toLowerCase();
+          const hay = [el.innerText || el.value || '', el.getAttribute('aria-label') || '', el.getAttribute('placeholder') || '',
+            el.getAttribute('name') || '', el.getAttribute('title') || '', el.getAttribute('role') || '', tag, type].join(' ').toLowerCase();
+          let score = 0;
+          for (const t of tokens) if (t.length > 1 && hay.includes(t)) score += 1;
+          if (tokens.includes('button') && (tag === 'button' || el.getAttribute('role') === 'button' || /submit|button/.test(type))) score += 1.5;
+          if (tokens.includes('link') && (tag === 'a' || el.getAttribute('role') === 'link')) score += 1.5;
+          if (tokens.includes('search') && /search/.test(hay)) score += 1.5;
+          if ((tokens.includes('input') || tokens.includes('field')) && /^(input|textarea|select)$/.test(tag)) score += 1;
+          if (tokens.includes('checkbox') && type === 'checkbox') score += 1.5;
+          if (score <= 0) continue;
+          const ref = 'ref_f' + (++i);
+          el.setAttribute('data-arc-ref', ref);
+          const text = (el.innerText || el.value || el.getAttribute('aria-label') || el.getAttribute('placeholder') || '').replace(/\s+/g, ' ').trim().slice(0, 100);
+          scored.push({ ref, score, tag, role: el.getAttribute('role') || undefined, text: text || undefined, x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) });
+        }
+        scored.sort((a, b) => b.score - a.score);
+        return scored.slice(0, 20).map(({ score, ...rest }) => rest);
+      }, [query]);
+      if (!items || !items.length) return _ok('No matching elements found for: ' + query);
+      return _ok(JSON.stringify(items));
+    } catch (e) { return _err('find failed: ' + (e.message || e)); }
+  },
+
+  // Set a value on a form element by its data-arc-ref (from read_page/find).
+  // Uses the native value setter so frameworks (React etc.) register the change.
+  async form_input(args) {
+    const { ref, value, tabId } = args || {};
+    if (!ref) return _err('ref is required (get one from read_page or find).');
+    let id;
+    try { id = await _resolveTabId(tabId); } catch (e) { return _err(e.message); }
+    try {
+      const res = await _execInPage(id, (ref, value) => {
+        const el = document.querySelector('[data-arc-ref="' + ref + '"]');
+        if (!el) return { ok: false, msg: 'no element for ' + ref + ' (re-run read_page/find)' };
+        const tag = el.tagName.toLowerCase();
+        const type = (el.type || '').toLowerCase();
+        const fire = () => { el.dispatchEvent(new Event('input', { bubbles: true })); el.dispatchEvent(new Event('change', { bubbles: true })); };
+        if (type === 'checkbox' || type === 'radio') {
+          const want = (value === true || value === 'true' || value === 'on' || value === 1 || value === '1');
+          if (el.checked !== want) { el.checked = want; fire(); }
+          return { ok: true, set: el.checked };
+        }
+        if (tag === 'select') {
+          const v = String(value); let matched = false;
+          for (const opt of el.options) { if (opt.value === v || opt.text.trim() === v.trim()) { el.value = opt.value; matched = true; break; } }
+          if (!matched) return { ok: false, msg: 'no option matching "' + v + '"' };
+          fire(); return { ok: true, set: el.value };
+        }
+        if (el.isContentEditable) { el.focus(); el.textContent = String(value); fire(); return { ok: true, set: String(value) }; }
+        el.focus();
+        const setter = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), 'value');
+        if (setter && setter.set) setter.set.call(el, String(value)); else el.value = String(value);
+        fire();
+        return { ok: true, set: el.value };
+      }, [ref, value]);
+      if (!res || !res.ok) return _err('form_input: ' + (res ? res.msg : 'failed'));
+      return _ok('Set ' + ref + ' = ' + JSON.stringify(res.set));
+    } catch (e) { return _err('form_input failed: ' + (e.message || e)); }
+  },
+
+  // Read console output. CDP's Runtime events aren't available in Arc, so we
+  // install a console/error collector in the page on first call and read its
+  // ring buffer. LIMITATION: messages emitted before this first call on a given
+  // page (e.g. early page-load logs) are not retained — call it early, or
+  // re-trigger the action you want to observe and read again.
+  async read_console_messages(args) {
+    const { tabId, pattern, onlyErrors, limit, clear } = args || {};
+    let id;
+    try { id = await _resolveTabId(tabId); } catch (e) { return _err(e.message); }
+    try {
+      await _execInPage(id, () => {
+        if (window.__arcConsoleInstalled) return;
+        window.__arcConsoleInstalled = true;
+        const buf = window.__arcConsole = window.__arcConsole || [];
+        const MAX = 500;
+        const push = (type, text) => { buf.push({ type, text, ts: Date.now() }); if (buf.length > MAX) buf.shift(); };
+        for (const t of ['log', 'info', 'warn', 'error', 'debug']) {
+          const orig = console[t];
+          if (typeof orig === 'function') console[t] = function (...a) {
+            try { push(t, a.map(x => { try { return typeof x === 'string' ? x : JSON.stringify(x); } catch (e) { return String(x); } }).join(' ')); } catch (e) {}
+            return orig.apply(this, a);
+          };
+        }
+        window.addEventListener('error', e => push('error', (e.message || 'Error') + (e.filename ? ' @ ' + e.filename + ':' + e.lineno : '')));
+        window.addEventListener('unhandledrejection', e => push('error', 'Unhandled rejection: ' + ((e.reason && e.reason.message) || e.reason)));
+      });
+      const msgs = await _execInPage(id, (clr) => {
+        const buf = window.__arcConsole || [];
+        const copy = buf.slice();
+        if (clr) buf.length = 0;
+        return copy;
+      }, [!!clear]);
+      let list = msgs || [];
+      if (onlyErrors) list = list.filter(m => m.type === 'error');
+      if (pattern) { let re; try { re = new RegExp(pattern, 'i'); } catch (e) { re = null; } if (re) list = list.filter(m => re.test(m.text)); }
+      const lim = typeof limit === 'number' ? limit : 100;
+      list = list.slice(-lim);
+      if (!list.length) return _ok('(no matching console messages. Note: the Arc collector retains messages from its first invocation on this page forward; earlier page-load messages are not available.)');
+      return _ok(list.map(m => '[' + m.type + '] ' + m.text).join('\n'));
+    } catch (e) { return _err('read_console_messages failed: ' + (e.message || e)); }
+  },
+
   async computer(args) {
     const { action } = args || {};
     let id;
     try { id = await _resolveTabId(args && args.tabId); } catch (e) { return _err(e.message); }
-    const shot = async () => _imageResult(await _captureBase64(id));
+    const shot = async () => _captureWithNote(id);
 
     if (action === 'screenshot') {
       try { return await shot(); } catch (e) { return _err('Screenshot failed: ' + e.message); }
