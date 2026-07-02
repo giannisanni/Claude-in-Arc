@@ -8,7 +8,7 @@
  * them here via self._arcBridgeInterceptor.handleBridgeToolCall().
  */
 
-const _INTERCEPTOR_VERSION = '0.4.0';
+const _INTERCEPTOR_VERSION = '0.5.0';
 const _MAX_PAGE_TEXT = 50000;
 const _STORAGE_KEY = 'claude_arc_mcp_group';
 
@@ -181,18 +181,37 @@ const TOOL_HANDLERS = {
     let id;
     try { id = await _resolveTabId(tabId); } catch (e) { return _err(e.message); }
     try {
-      const out = await _execInPage(id, async (code) => {
-        let val;
-        try { val = await (0, eval)('(async () => (' + code + '\n))()'); }
-        catch (e) {
-          if (e instanceof SyntaxError) val = await (0, eval)('(async () => {' + code + '\n})()');
-          else throw e;
-        }
-        if (val === undefined) return '__undefined__';
-        if (typeof val === 'string') return val;
-        try { return JSON.stringify(val); } catch { return String(val); }
-      }, [text]);
-      return _ok(out === '__undefined__' ? 'undefined' : String(out));
+      // SECURITY: eval() is intentional and load-bearing here — this tool IS an
+      // arbitrary-JS REPL (same contract as the official javascript_tool); its
+      // only input is the code the MCP caller explicitly asked to run.
+      // The func returns ['ok'|'err', payload] so a throw inside the page never
+      // surfaces as a silent null result (Chrome maps MAIN-world throws to null).
+      const runner = async (code) => {
+        try {
+          let val;
+          try { val = await (0, eval)('(async () => (' + code + '\n))()'); }
+          catch (e) {
+            if (e instanceof SyntaxError) val = await (0, eval)('(async () => {' + code + '\n})()');
+            else throw e;
+          }
+          if (val === undefined) return ['ok', '__undefined__'];
+          if (typeof val === 'string') return ['ok', val];
+          try { return ['ok', JSON.stringify(val)]; } catch { return ['ok', String(val)]; }
+        } catch (e) { return ['err', (e && e.message) || String(e)]; }
+      };
+      let out = await _execInPage(id, runner, [text]);
+      let note = '';
+      const cspBlocked = !out || (out[0] === 'err' && /unsafe-eval|Content Security Policy/i.test(out[1]));
+      if (cspBlocked) {
+        // Page CSP kills MAIN-world eval (e.g. docs.google.com). The ISOLATED
+        // world isn't bound by page CSP: full DOM access, but no page JS vars.
+        const [res] = await chrome.scripting.executeScript({ target: { tabId: id }, func: runner, args: [text], world: 'ISOLATED' });
+        out = res ? res.result : null;
+        note = '\n[arc] Page CSP blocked MAIN-world eval; ran in ISOLATED world instead (DOM available, page JS variables are not).';
+      }
+      if (!out) return _err('JS returned no result (page CSP may block eval in both worlds).');
+      if (out[0] === 'err') return _err('JS threw: ' + out[1]);
+      return _ok((out[1] === '__undefined__' ? 'undefined' : String(out[1])) + note);
     } catch (e) {
       return _err('JS failed: ' + (e.message || e) +
         ' — the page CSP may block eval() (the debugger path that avoids CSP is unavailable in Arc).');
@@ -394,6 +413,20 @@ const TOOL_HANDLERS = {
         return await shot();
       } catch (e) { return _err('Scroll failed: ' + e.message); }
     }
+    if (action === 'scroll_to') {
+      if (!args.ref) return _err('scroll_to needs a ref (from read_page or find).');
+      try {
+        const found = await _execInPage(id, (ref) => {
+          const el = document.querySelector('[data-arc-ref="' + ref + '"]');
+          if (!el) return false;
+          el.scrollIntoView({ block: 'center', inline: 'nearest' });
+          return true;
+        }, [args.ref]);
+        if (!found) return _err('No element for ' + args.ref + ' (re-run read_page/find).');
+        await new Promise(r => setTimeout(r, 300));
+        return await shot();
+      } catch (e) { return _err('scroll_to failed: ' + e.message); }
+    }
     if (action === 'zoom') {
       try {
         const b64 = await _captureBase64(id);
@@ -424,23 +457,45 @@ const TOOL_HANDLERS = {
           if (ref) { el = document.querySelector('[data-arc-ref="' + ref + '"]'); if (el) { const r = el.getBoundingClientRect(); cx = r.x + r.width / 2; cy = r.y + r.height / 2; } }
           if (!el && coord && coord.length === 2) { cx = coord[0] / (window.devicePixelRatio || 1); cy = coord[1] / (window.devicePixelRatio || 1); el = document.elementFromPoint(cx, cy); }
           if (!el) return false;
-          const o = { bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy };
-          if (act === 'hover') { el.dispatchEvent(new MouseEvent('mousemove', o)); el.dispatchEvent(new MouseEvent('mouseover', o)); return true; }
-          el.dispatchEvent(new MouseEvent('mousedown', o));
-          // Trusted clicks move focus on mousedown; synthetic events don't, so
-          // do it explicitly. This is what makes a click→type flow land in the
-          // field the user just clicked (focusable element or its closest one).
-          const focusable = el.closest('input,textarea,select,button,a[href],[contenteditable=""],[contenteditable="true"],[tabindex]') || el;
-          if (typeof focusable.focus === 'function') { try { focusable.focus(); } catch (e) {} }
-          el.dispatchEvent(new MouseEvent('mouseup', o));
-          if (act === 'right_click') { el.dispatchEvent(new MouseEvent('contextmenu', o)); return true; }
-          el.dispatchEvent(new MouseEvent('click', o));
-          if (act === 'double_click') el.dispatchEvent(new MouseEvent('dblclick', o));
-          else if (typeof el.click === 'function') el.click();
+          // Emulate the full trusted-input sequence. Modern UIs (Google jsaction,
+          // React 17+, Cloudflare dash) listen for POINTER events and/or check
+          // event.detail/button(s); bare MouseEvents with detail:0 get ignored.
+          const btn = act === 'right_click' ? 2 : 0;
+          const base = { bubbles: true, cancelable: true, composed: true, view: window,
+            clientX: cx, clientY: cy, button: btn, detail: 1,
+            pointerId: 1, pointerType: 'mouse', isPrimary: true };
+          const fire = (type, extra) => {
+            const o = Object.assign({}, base, extra);
+            const ev = type.startsWith('pointer') && window.PointerEvent
+              ? new PointerEvent(type, o) : new MouseEvent(type, o);
+            el.dispatchEvent(ev);
+          };
+          fire('pointermove', { buttons: 0 }); fire('mousemove', { buttons: 0 });
+          fire('pointerover', { buttons: 0 }); fire('mouseover', { buttons: 0 });
+          fire('pointerenter', { bubbles: false, buttons: 0 }); fire('mouseenter', { bubbles: false, buttons: 0 });
+          if (act === 'hover') return true;
+          const clickOnce = (detail) => {
+            fire('pointerdown', { buttons: btn === 2 ? 2 : 1, detail });
+            fire('mousedown', { buttons: btn === 2 ? 2 : 1, detail });
+            // Trusted clicks move focus on mousedown; synthetic events don't, so
+            // do it explicitly. This is what makes a click→type flow land in the
+            // field the user just clicked (focusable element or its closest one).
+            const focusable = el.closest('input,textarea,select,button,a[href],[contenteditable=""],[contenteditable="true"],[tabindex]') || el;
+            if (typeof focusable.focus === 'function') { try { focusable.focus(); } catch (e) {} }
+            fire('pointerup', { buttons: 0, detail });
+            fire('mouseup', { buttons: 0, detail });
+            if (btn === 2) { fire('contextmenu', { buttons: 0, detail }); return; }
+            fire('click', { buttons: 0, detail });
+          };
+          clickOnce(1);
+          if (act === 'double_click') { clickOnce(2); fire('dblclick', { buttons: 0, detail: 2 }); }
+          else if (act === 'left_click' && typeof el.click === 'function') el.click();
           return true;
         }, [action, args.ref || null, args.coordinate || null]);
         if (!did) return _err('No element found at the given ref/coordinate.');
-        await new Promise(r => setTimeout(r, 250));
+        // 450ms: dropdowns/menus animate open after click; 250ms returned
+        // pre-render frames (popup invisible in the screenshot).
+        await new Promise(r => setTimeout(r, 450));
         return await shot();
       } catch (e) { return _err(action + ' failed: ' + e.message); }
     }
@@ -466,11 +521,29 @@ const TOOL_HANDLERS = {
     if (action === 'key') {
       try {
         await _execInPage(id, (keys) => {
+          // Normalize CDP/xdotool-style names to DOM key values and include
+          // keyCode/code — Google/Cloudflare handlers switch on keyCode, and
+          // "Down" (instead of "ArrowDown") silently matches nothing.
+          const NAME = { down: 'ArrowDown', up: 'ArrowUp', left: 'ArrowLeft', right: 'ArrowRight',
+            esc: 'Escape', return: 'Enter', space: ' ', pgdn: 'PageDown', pgup: 'PageUp',
+            del: 'Delete', ins: 'Insert', bs: 'Backspace' };
+          const CODE = { Enter: 13, Escape: 27, ' ': 32, PageUp: 33, PageDown: 34, End: 35, Home: 36,
+            ArrowLeft: 37, ArrowUp: 38, ArrowRight: 39, ArrowDown: 40, Delete: 46, Backspace: 8, Tab: 9 };
           const el = document.activeElement || document.body;
           for (const combo of String(keys).split(' ')) {
-            const key = combo.split('+').pop();
-            el.dispatchEvent(new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true }));
-            el.dispatchEvent(new KeyboardEvent('keyup', { key, bubbles: true, cancelable: true }));
+            const parts = combo.split('+');
+            const raw = parts.pop();
+            const key = NAME[raw.toLowerCase()] || raw;
+            const mods = parts.map(m => m.toLowerCase());
+            const o = { key, bubbles: true, cancelable: true, composed: true,
+              keyCode: CODE[key] || (key.length === 1 ? key.toUpperCase().charCodeAt(0) : 0),
+              which: CODE[key] || (key.length === 1 ? key.toUpperCase().charCodeAt(0) : 0),
+              code: key.length === 1 ? 'Key' + key.toUpperCase() : key,
+              ctrlKey: mods.includes('ctrl'), shiftKey: mods.includes('shift'),
+              altKey: mods.includes('alt'), metaKey: mods.includes('cmd') || mods.includes('meta') };
+            el.dispatchEvent(new KeyboardEvent('keydown', o));
+            if (key.length === 1) el.dispatchEvent(new KeyboardEvent('keypress', o));
+            el.dispatchEvent(new KeyboardEvent('keyup', o));
           }
         }, [args.text || '']);
         await new Promise(r => setTimeout(r, 150));
